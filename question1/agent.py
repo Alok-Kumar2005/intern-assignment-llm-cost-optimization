@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
+from shared.kb import article_ids
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -32,19 +31,24 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
+# Compressed KB - just the essential facts
+_COMPACT_KB = """returns-within-30-days: Physical items, resalable condition, refund within 30 days of delivery
+digital-license-no-refund: Digital products not refundable after license/download revealed
+custom-items-no-replace: Custom/personalized items not eligible for auto replacement, escalate to Tier 2
+damage-replacement-7-days: Standard catalog items damaged within 7 days qualify for free replacement
+subscription-cooling-off: Annual subscriptions get prorated refund if cancelled within 30 days"""
 
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+# Minimal examples
+_FEW_SHOT = """Examples:
+physical,!opened,≤30d→{"action":"REFUND","kb_article":"returns-within-30-days"}
+digital,revealed→{"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
+custom,damaged→{"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
+catalog,damaged,≤7d→{"action":"REPLACE","kb_article":"damage-replacement-7-days"}"""
 
 
 class SupportCopilot:
     """
-    ShopAssist Tier-1 copilot (baseline).
+    ShopAssist Tier-1 copilot (optimized).
 
     Given a support ticket + order snapshot, choose an action, cite the help-center
     article, and draft the customer reply.
@@ -60,22 +64,18 @@ class SupportCopilot:
         thread = format_thread(ticket)
         snapshot = json.dumps(order, indent=2)
 
+        # Stable system prompt for caching (no UUID)
         system = "\n\n".join(
             [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
+                "ShopAssist Tier-1 support copilot.",
                 _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
+                f"KB:\n{_COMPACT_KB}",
+                'Output JSON only: {"action":"<ACTION>","kb_article":"<article-id>","customer_reply":"<reply>"}',
             ]
         )
         user = "\n\n".join(
             [
-                f"TICKET_ID: {ticket_id}",
+                f"TICKET: {ticket_id}",
                 f"THREAD:\n{thread}",
                 f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
             ]
@@ -84,5 +84,13 @@ class SupportCopilot:
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         messages = self.build_messages(ticket_id)
-        completion = self.llm.chat("handle_ticket", messages)
+        
+        # Enable caching on the system message
+        system_content = messages[0].content
+        
+        completion = self.llm.chat(
+            "handle_ticket", 
+            messages,
+            cached_prefix=system_content
+        )
         return parse_resolution(completion)
